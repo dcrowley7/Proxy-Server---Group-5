@@ -11,7 +11,7 @@
 #include <vector>
 #include <cstring>
 
-#define PORT_NUM "32001"
+#define PORT_NUM "8080"
 
 const int BUFFER_SIZE = 4096;
 
@@ -32,17 +32,18 @@ std::string getFileName(std::string, std::string);
 std::string getHostName(std::string);
 std::string removeHostName(std::string, std::string);
 
+/* Loads cuss words from text file for profanity filter */
 void loadCussWords() {
-  std::ifstream myfile("cussWords.txt");
+  std::ifstream cussWordsFile("cussWords.txt");
 
-  if (myfile.is_open()) {
+  if (cussWordsFile.is_open()) {
 	std::string line;
 
-	while (getline (myfile, line)) {
+	while (getline(cussWordsFile, line)) {
 		profanityList.push_back(line);
 	}
 
-    myfile.close();
+	cussWordsFile.close();
   } else {
 	std::cout << "Unable to load cuss word filter." << std::endl
 	          << "Please make sure 'cussWords.txt' is in the same directory as the proxy server." << std::endl;
@@ -57,6 +58,7 @@ void * get_in_addr(struct sockaddr * sa) {
     return &(((struct sockaddr_in6 *)sa)->sin6_addr);
 }
 
+/* Connects the proxy to the web server */
 int contactServer(std::string hostname) {
 	int sockfd;
 
@@ -101,41 +103,75 @@ int contactServer(std::string hostname) {
     return sockfd;
 }
 
+/* Multithreaded function that handles the request and response for a single object */
 void * handleConnection(void * pnewsock) {
 	int clientSocket = *(int *)pnewsock;
 
 	char clientRequest[BUFFER_SIZE];
 
+	// Receive client request
 	int clientRequestResult = recv(clientSocket, clientRequest, BUFFER_SIZE, 0);
 
 	if (clientRequestResult <= 0) {
+		std::cout << "Read error when reading first request from client: " << clientRequestResult << std::endl;
 		close(clientSocket);
 		return NULL;
 	}
 
+	// Cut off excess data
 	clientRequest[clientRequestResult] = '\0';
 
 	std::string formattedRequest = clientRequest;
 
+	// Grab hostname if not already connected to the web server
 	if (currentHostName.length() == 0 || hasHostName(formattedRequest)) {
-		currentHostName = getHostName(formattedRequest);
+		std::string hostName = getHostName(formattedRequest);
+
+		if (hostName.length() != 0) {
+			currentHostName = hostName;
+		} else {
+			std::cout << "Could not extract hostname from the request" << std::endl;
+			close(clientSocket);
+			return NULL;
+		}
+
+		// Remove hostname from request for simplicity's sake
+		formattedRequest = removeHostName(currentHostName, formattedRequest);
+
+		if (formattedRequest.length() == 0) {
+			std::cout << "Could not remove hostname from request." << std::endl;
+			close(clientSocket);
+			return NULL;
+		}
 	}
 
-	formattedRequest = removeHostName(currentHostName, formattedRequest);
-
+	// Check if site is blacklisted
 	if (isBlackListed(currentHostName, blackList)) {
+
+		// Send 403 - Forbidden page if blacklisted
 		send403Error(clientSocket);
 		close(clientSocket);
 		return NULL;
 	}
 
+	// Create the filename (including directory structure) for locating an object
+	// 	      if it is cached
 	std::string filename = getFileName(currentHostName, formattedRequest);
 
+	if (filename.length() == 0) {
+		std::cout << "Could not parse request for object name." << std::endl;
+		close(clientSocket);
+		return NULL;
+	}
+
+	// Log request
 	std::cout << "Request  (" << filename << ")" << std::endl;
 
+	// Get object size (content-length + header or actual message size)
 	int responseLength = getObjectSize(formattedRequest);
 
-	if (responseLength > 0) {
+	// Get entire request (if larger than buffer)
+	if (responseLength > 0) { // For non-chunked requests
 		std::stringstream buffer;
 
 		buffer << formattedRequest;
@@ -149,6 +185,7 @@ void * handleConnection(void * pnewsock) {
 				clientRequest[clientRequestResult] = '\0';
 				buffer << clientRequest;
 			} else {
+				std::cout << "Read error when getting the rest of the request from the client. (Non-Chunked)" << std::endl;
 				close(clientSocket);
 				return NULL;
 			}
@@ -157,20 +194,43 @@ void * handleConnection(void * pnewsock) {
 		}
 
 		formattedRequest = buffer.str();
-	} else {
-		std::cout << "Chunked request encountered." << std::endl;
-		exit(0);
+	} else { // For chunked requests
+		std::stringstream buffer;
+
+		buffer << formattedRequest;
+
+		int size = responseLength - formattedRequest.length();
+
+		while (!hasEnded(clientRequest)) {
+			clientRequestResult = recv(clientSocket, clientRequest, BUFFER_SIZE, 0);
+
+			if (clientRequestResult > 0) {
+				clientRequest[clientRequestResult] = '\0';
+				buffer << clientRequest;
+			} else {
+				std::cout << "Read error when getting the rest of the request from the client. (Chunked)" << std::endl;
+				close(clientSocket);
+				return NULL;
+			}
+		}
+
+		formattedRequest = buffer.str();
 	}
 
+	// Remove web browsers headers and add our own to the request
 	formattedRequest = stripHeader(formattedRequest, currentHostName);
 
+	// Retrieve object from the webserver if the object is not already cached
 	if(!fileCached(filename, clientSocket)) {
+
+		// Connect to web server
 		int webServerSocket = contactServer(currentHostName);
 
+		// Send request to webserver
 		int serverSendResult = send(webServerSocket, formattedRequest.c_str(), formattedRequest.length(), 0);
 
 		if (serverSendResult == -1) {
-			std::cout << "Send error. (Server)" << std::endl;
+			std::cout << "Send error when sending first chunk of request to web server." << std::endl;
 			close(webServerSocket);
 			close(clientSocket);
 			return NULL;
@@ -178,31 +238,44 @@ void * handleConnection(void * pnewsock) {
 
 		char serverResponse[BUFFER_SIZE];
 
+		// Receive data from webserver and send directly to client
 		const int webServerResponse = receiveSend(webServerSocket, clientSocket, serverResponse, filename, profanityList);
 
 		if (webServerResponse < 0) {
+			std::cout << "Read error when receiving first chunk of response from web server." << std::endl;
 			close(webServerSocket);
 			close(clientSocket);
 			return NULL;
 		}
 
+		// Get size of response
 		responseLength = getObjectSize(serverResponse);
 
-		if (responseLength == 0) {
+		// Grab the entire response if larger than buffer
+		if (responseLength == 0) { // Chunked responses
+
+			// Loop until all bytes have been received and sent
 			while (!hasEnded(serverResponse)) {
+
+				// Receive chunk from server and send immediately to client
 				const int webServerResponseResult = receiveSend(webServerSocket, clientSocket, serverResponse, filename, profanityList);
 
 				if (webServerResponseResult < 0) {
+					std::cout << "Read error when receiving additional chunks of response from web server. (Chunked Response)" << std::endl;
 					break;
 				}
 			}
-		} else {
+		} else { // Non-chunked responses
 			int size = responseLength - webServerResponse;
 
+			// Loop until all bytes have been received and sent
 			while (size > 0) {
+
+				// Receive chunk from server and send immediately to client
 				const int webServerResponseResult = receiveSend(webServerSocket, clientSocket, serverResponse, filename, profanityList);
 
 				if (webServerResponseResult < 0) {
+					std::cout << "Read error when receiving additional chunks of response from web server. (Non-Chunked Response)" << std::endl;
 					break;
 				}
 
@@ -217,15 +290,21 @@ void * handleConnection(void * pnewsock) {
 	return NULL;
 }
 
-int main(int argc, char *argv[]) {;
+int main(int argc, char *argv[]) {
+	std::cout << "Starting proxy server..." << std::endl;
+
+	// Add blacklisted sites
 	blackList.push_back("youtube.com");
 	blackList.push_back("facebook.com");
 	blackList.push_back("hulu.com");
 	blackList.push_back("virus.com");
 
+	// Load cuss filter from file
 	loadCussWords();
 
 	struct addrinfo hints, *res;
+
+	/* Set up socket connection for incoming client requests */
 
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family   = AF_INET;
